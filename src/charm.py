@@ -12,10 +12,15 @@ from ops.framework import StoredState
 from ops.main import main
 from ops.model import (
     ActiveStatus,
+    BlockedStatus,
     MaintenanceStatus,
     ModelError,
     WaitingStatus,
 )
+from shutil import copyfile
+from subprocess import check_output, CalledProcessError, STDOUT, PIPE
+from textwrap import dedent
+
 
 logger = logging.getLogger(__name__)
 PEER = "mysql"
@@ -31,12 +36,14 @@ class MySQLCharm(CharmBase):
         super().__init__(*args)
         self._stored.set_default(
             mysql_initialized=False,
+            mysql_install_error=False,
             pebble_ready=False,
         )
         self.image = OCIImageResource(self, "mysql-image")
         self.framework.observe(
             self.on.mysql_pebble_ready, self._on_pebble_ready
         )
+        self.framework.observe(self.on.install, self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.update_status, self._on_update_status)
         self._provide_mysql()
@@ -49,6 +56,9 @@ class MySQLCharm(CharmBase):
         self._stored.pebble_ready = True
         self._update_peers()
         self._configure_pod()
+
+    def _on_install(self, _):
+        self._install_mysql_shell()
 
     def _on_config_changed(self, event):
         """Set a new Juju pod specification"""
@@ -214,6 +224,40 @@ class MySQLCharm(CharmBase):
     def _is_mysql_initialized(self) -> bool:
         return self._stored.mysql_initialized
 
+    def _install_mysql_shell(self):
+        try:
+            self._update_apt()
+            self._install_required_packages()
+            self._add_mysql_repo()
+            self._add_mysql_pubkey()
+            self._update_apt()
+            check_output(
+                "apt-get install -y mysql-shell", stderr=STDOUT, shell=True
+            )
+        except CalledProcessError as e:
+            logger.error(e)
+            self.unit.status = BlockedStatus(str(e))
+            self._stored.mysql_install_error = True
+
+    def _update_apt(self):
+        check_output("apt-get update", stderr=STDOUT, shell=True)
+
+    def _install_required_packages(self):
+        check_output("apt-get install -y gnupg", stderr=STDOUT, shell=True)
+
+    def _add_mysql_repo(self):
+        copyfile("files/mysql.list", "/etc/apt/sources.list.d/mysql.list")
+        logger.debug("File mysql.list copied into the sidecar container")
+        copyfile("files/mysql_pubkey.asc", "/tmp/mysql_pubkey.asc")
+        logger.debug("File mysql_pubkey.asc copied into the sidecar container")
+
+    def _add_mysql_pubkey(self):
+        check_output(
+            "apt-key add /tmp/mysql_pubkey.asc",
+            stderr=STDOUT,
+            shell=True,
+        )
+        logger.debug("mysql_pubkey.asc key to your system's GPG keyring")
 
 if __name__ == "__main__":
     main(MySQLCharm)
